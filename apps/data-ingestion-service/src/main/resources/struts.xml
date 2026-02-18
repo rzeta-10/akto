@@ -52,7 +52,7 @@
             </result>
         </action>
 
-        <!-- Arcade Webhook Endpoints -->
+
         <action name="health" class="com.akto.action.ArcadeWebhookAction" method="health">
             <interceptor-ref name="defaultStack" />
             <result name="SUCCESS" type="json">
@@ -60,8 +60,14 @@
             </result>
         </action>
 
-        <!-- Pre-execution hook: returns code (OK/CHECK_FAILED/RATE_LIMIT_EXCEEDED), error_message, override -->
-        <!-- Per Arcade API: execution_id is NOT in response, only in request for correlation -->
+        <action name="access" class="com.akto.action.ArcadeWebhookAction" method="access">
+            <interceptor-ref name="defaultStack" />
+            <result name="SUCCESS" type="json">
+                <param name="includeProperties">^only.*,^deny.*</param>
+                <param name="excludeNullProperties">true</param>
+            </result>
+        </action>
+
         <action name="pre" class="com.akto.action.ArcadeWebhookAction" method="preExecution">
             <interceptor-ref name="defaultStack" />
             <result name="SUCCESS" type="json">
@@ -74,8 +80,6 @@
             </result>
         </action>
 
-        <!-- Post-execution hook: returns code (OK/CHECK_FAILED/RATE_LIMIT_EXCEEDED), error_message, override -->
-        <!-- Per Arcade API: execution_id is NOT in response, only in request for correlation -->
         <action name="post" class="com.akto.action.ArcadeWebhookAction" method="postExecution">
             <interceptor-ref name="defaultStack" />
             <result name="SUCCESS" type="json">
