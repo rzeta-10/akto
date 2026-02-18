@@ -11,6 +11,8 @@ import org.apache.struts2.ServletActionContext;
 import javax.servlet.http.HttpServletRequest;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -29,14 +31,18 @@ public class ArcadeWebhookAction extends ActionSupport {
     private static final String ARCADE_HOST = "arcade.dev";
     private static final String AKTO_CONNECTOR = "arcade";
     private static final String HEADER_EXECUTION_ID = "x-arcade-execution-id";
+    private static final String PATH_PREFIX_TOOLS = "/tools/";
+    private static final String RESULT_SUCCESS = Action.SUCCESS.toUpperCase();
 
     // Arcade API response codes
     private static final String CODE_OK = "OK";
     private static final String CODE_CHECK_FAILED = "CHECK_FAILED";
+    private static final String BLOCKED_MESSAGE_PREFIX = "Blocked by Akto Guardrails: ";
+    private static final String ERROR_INTERNAL = "Internal error";
+    private static final String UNKNOWN_TOOL = "unknown";
 
     static {
         gateway.setDataPublisher(new KafkaDataPublisher());
-        loggerMaker.info("ArcadeWebhookAction initialized with KafkaDataPublisher");
     }
 
 
@@ -63,106 +69,58 @@ public class ArcadeWebhookAction extends ActionSupport {
 
     private Map<String, Object> deny;
 
-
-    public String getExecution_id()              { return execution_id; }
-    public void   setExecution_id(String v)      { this.execution_id = v; }
-    public String getError_message()             { return error_message; }
-    public void   setError_message(String v)     { this.error_message = v; }
-    public String getExecution_code()            { return execution_code; }
-    public void   setExecution_code(String v)    { this.execution_code = v; }
-    public String getExecution_error()           { return execution_error; }
-    public void   setExecution_error(String v)   { this.execution_error = v; }
-    public String getUser_id()                   { return user_id; }
-    public void   setUser_id(String v)           { this.user_id = v; }
-
-
     public String health() {
         status = "healthy";
-        return Action.SUCCESS.toUpperCase();
+        return RESULT_SUCCESS;
     }
 
     public String access() {
-        loggerMaker.info("Arcade /access hook called");
-
         this.only = null;
         this.deny = null;
-        return Action.SUCCESS.toUpperCase();
+        return RESULT_SUCCESS;
     }
 
-   
     public String preExecution() {
         try {
-            HttpServletRequest request = ServletActionContext.getRequest();
-            Map<String, Object> bodyMap = parseJsonBody(readRequestBody(request));
-            populateFieldsFromRequest(bodyMap, request);
-
+            parseAndPopulateFromRequest(ServletActionContext.getRequest());
             Map<String, Object> proxyData = buildPreProxyData();
             Map<String, Object> gatewayResponse = gateway.processHttpProxy(proxyData);
 
             if (isRequestBlocked(gatewayResponse)) {
-                String reason = extractBlockReason(gatewayResponse);
-                String blockedMessage = "Blocked by Akto Guardrails: " + reason;
-                this.code = CODE_CHECK_FAILED;
-                this.error_message = blockedMessage;
-                loggerMaker.info("Pre-execution blocked: " + reason + ", execution_id: " + execution_id);
-
-                final Map<String, Object> capturedProxyData = proxyData;
-                final String capturedMessage = blockedMessage;
-                final String capturedExecutionId = execution_id;
+                String blockedMessage = formatBlockedMessage(extractBlockReason(gatewayResponse));
+                setCheckFailed(blockedMessage);
+                final String executionIdForIngest = execution_id;
                 CompletableFuture.runAsync(() ->
-                        ingestBlockedRequest(capturedProxyData, capturedMessage, capturedExecutionId));
+                        ingestBlockedRequest(proxyData, blockedMessage, executionIdForIngest));
             } else {
                 this.code = CODE_OK;
-                loggerMaker.info("Pre-execution allowed, execution_id: " + execution_id);
             }
-
         } catch (Exception e) {
-            loggerMaker.errorAndAddToDb("Error in pre hook: " + e.getMessage(),
-                    LoggerMaker.LogDb.DATA_INGESTION);
-            this.code = CODE_CHECK_FAILED;
-            this.error_message = "Internal error";
+            logError("Error in pre hook", e);
+            setCheckFailed(ERROR_INTERNAL);
         }
-        return Action.SUCCESS.toUpperCase();
+        return RESULT_SUCCESS;
     }
 
     public String postExecution() {
         try {
-            HttpServletRequest request = ServletActionContext.getRequest();
-            Map<String, Object> bodyMap = parseJsonBody(readRequestBody(request));
-            populateFieldsFromRequest(bodyMap, request);
-
-            final Map<String, Object> proxyData = buildPostProxyData();
-            final String capturedExecutionId = execution_id;
-            CompletableFuture.runAsync(() -> {
-                try {
-                    gateway.processHttpProxy(proxyData);
-                    loggerMaker.info("Post-execution ingested, execution_id: " + capturedExecutionId);
-                } catch (Exception e) {
-                    loggerMaker.errorAndAddToDb("Error ingesting post-execution data: " + e.getMessage(),
-                            LoggerMaker.LogDb.DATA_INGESTION);
-                }
-            });
+            parseAndPopulateFromRequest(ServletActionContext.getRequest());
+            Map<String, Object> proxyData = buildPostProxyData();
+            CompletableFuture.runAsync(() -> processHttpProxySafe(proxyData, "Error ingesting post-execution data"));
 
             this.code = CODE_OK;
-            loggerMaker.info("Post-execution accepted, execution_id: " + execution_id);
-
         } catch (Exception e) {
-            loggerMaker.errorAndAddToDb("Error in post hook: " + e.getMessage(),
-                    LoggerMaker.LogDb.DATA_INGESTION);
+            logError("Error in post hook", e);
             this.code = CODE_OK;
         }
-        return Action.SUCCESS.toUpperCase();
+        return RESULT_SUCCESS;
     }
 
     private Map<String, Object> buildPreProxyData() throws Exception {
         String toolName = extractToolName();
-        String path = "/tools/" + toolName;
-
-        Map<String, Object> queryParams = new HashMap<>();
+        Map<String, Object> queryParams = baseQueryParams();
         queryParams.put("guardrails", "true");
-        queryParams.put("akto_connector", AKTO_CONNECTOR);
-
-        return buildProxyDataMap(path,
+        return buildProxyDataMap(pathForTool(toolName),
                 buildBaseRequestMap("pre_tool_execution", toolName),
                 null,
                 queryParams);
@@ -170,22 +128,29 @@ public class ArcadeWebhookAction extends ActionSupport {
 
     private Map<String, Object> buildPostProxyData() throws Exception {
         String toolName = extractToolName();
-        String path = "/tools/" + toolName;
-
         Map<String, Object> responseMap = new HashMap<>();
         responseMap.put("statusCode", Boolean.TRUE.equals(success) ? 200 : 500);
         responseMap.put("status", Boolean.TRUE.equals(success) ? "SUCCESS" : "ERROR");
         responseMap.put("body", output != null ? objectMapper.writeValueAsString(output) : "{}");
-        responseMap.put("headers", new HashMap<>());
+        responseMap.put("headers", Collections.emptyMap());
 
-        Map<String, Object> queryParams = new HashMap<>();
-        queryParams.put("akto_connector", AKTO_CONNECTOR);
+        Map<String, Object> queryParams = baseQueryParams();
         queryParams.put("ingest_data", "true");
 
-        return buildProxyDataMap(path,
+        return buildProxyDataMap(pathForTool(toolName),
                 buildBaseRequestMap("post_tool_execution", toolName),
                 responseMap,
                 queryParams);
+    }
+
+    private static String pathForTool(String toolName) {
+        return PATH_PREFIX_TOOLS + (toolName != null ? toolName : UNKNOWN_TOOL);
+    }
+
+    private static Map<String, Object> baseQueryParams() {
+        Map<String, Object> q = new HashMap<>();
+        q.put("akto_connector", AKTO_CONNECTOR);
+        return q;
     }
 
     private Map<String, Object> buildBaseRequestMap(String hookType, String toolName) {
@@ -214,13 +179,46 @@ public class ArcadeWebhookAction extends ActionSupport {
         return proxyData;
     }
 
+    private void parseAndPopulateFromRequest(HttpServletRequest request) {
+        if (request == null) return;
+        String rawBody = readRequestBody(request);
+        Map<String, Object> bodyMap = parseJsonBody(rawBody);
+        populateFieldsFromRequest(bodyMap, request);
+    }
+
+    private static String formatBlockedMessage(String reason) {
+        return isNullOrEmpty(reason) ? "" : BLOCKED_MESSAGE_PREFIX + reason;
+    }
+
+    private void setCheckFailed(String message) {
+        this.code = CODE_CHECK_FAILED;
+        this.error_message = message;
+    }
+
+    private void processHttpProxySafe(Map<String, Object> proxyData, String errorContext) {
+        try {
+            gateway.processHttpProxy(proxyData);
+        } catch (Exception e) {
+            logError(errorContext, e);
+        }
+    }
+
+    private void logError(String context, Exception e) {
+        String message = e != null && e.getMessage() != null ? e.getMessage() : (e != null ? e.getClass().getSimpleName() : "unknown");
+        loggerMaker.errorAndAddToDb(context + ": " + message, LoggerMaker.LogDb.DATA_INGESTION);
+    }
+
+    private static boolean isNullOrEmpty(String s) {
+        return s == null || s.isEmpty();
+    }
+
     private Map<String, Object> buildRequestHeaders(String hookType, String toolName) {
         Map<String, Object> headers = new HashMap<>();
         headers.put("host", ARCADE_HOST);
         headers.put("content-type", "application/json");
         headers.put("x-arcade-event", hookType);
 
-        if (execution_id != null && !execution_id.isEmpty()) {
+        if (!isNullOrEmpty(execution_id)) {
             headers.put("x-arcade-execution-id", execution_id);
         }
         if (toolName != null) {
@@ -234,9 +232,10 @@ public class ArcadeWebhookAction extends ActionSupport {
         }
         if (context != null) {
             for (Map.Entry<String, Object> entry : context.entrySet()) {
+                String key = entry.getKey();
                 Object value = entry.getValue();
-                if (value == null) continue;
-                String headerKey = "x-arcade-context-" + entry.getKey();
+                if (key == null || value == null) continue;
+                String headerKey = "x-arcade-context-" + key;
                 if (value instanceof String) {
                     headers.put(headerKey, value);
                 } else {
@@ -261,29 +260,36 @@ public class ArcadeWebhookAction extends ActionSupport {
 
 
     @SuppressWarnings("unchecked")
-    private boolean isRequestBlocked(Map<String, Object> gatewayResponse) {
-        if (gatewayResponse == null) return false;
-        Map<String, Object> guardrailsResult = extractMap(gatewayResponse.get("guardrailsResult"));
-        if (guardrailsResult == null || guardrailsResult.isEmpty()) return false;
+    private Map<String, Object> getGuardrailsResult(Map<String, Object> gatewayResponse) {
+        if (gatewayResponse == null) return null;
+        Map<String, Object> result = extractMap(gatewayResponse.get("guardrailsResult"));
+        return (result != null && !result.isEmpty()) ? result : null;
+    }
 
-        Object allowed = guardrailsResult.containsKey("Allowed")
-                ? guardrailsResult.get("Allowed")
-                : guardrailsResult.get("allowed");
+    private static Object getFromMap(Map<String, Object> map, String firstKey, String secondKey) {
+        if (map == null) return null;
+        if (map.containsKey(firstKey)) return map.get(firstKey);
+        return map.get(secondKey);
+    }
+
+    @SuppressWarnings("unchecked")
+    private boolean isRequestBlocked(Map<String, Object> gatewayResponse) {
+        Map<String, Object> guardrails = getGuardrailsResult(gatewayResponse);
+        if (guardrails == null) return false;
+
+        Object allowed = getFromMap(guardrails, "Allowed", "allowed");
         if (allowed == null) return false;
         if (allowed instanceof Boolean) return !Boolean.TRUE.equals(allowed);
         return !"true".equalsIgnoreCase(String.valueOf(allowed));
     }
 
     private String extractBlockReason(Map<String, Object> gatewayResponse) {
-        if (gatewayResponse == null) return "Request blocked by security policy";
-        Map<String, Object> guardrailsResult = extractMap(gatewayResponse.get("guardrailsResult"));
-        if (guardrailsResult == null) return "Request blocked by security policy";
+        Map<String, Object> guardrails = getGuardrailsResult(gatewayResponse);
+        if (guardrails == null) return null;
 
-        Object reason = guardrailsResult.containsKey("Reason")
-                ? guardrailsResult.get("Reason")
-                : guardrailsResult.get("reason");
+        Object reason = getFromMap(guardrails, "Reason", "reason");
         String reasonStr = extractString(reason);
-        return (reasonStr != null && !reasonStr.isEmpty()) ? reasonStr : "Request blocked by security policy";
+        return isNullOrEmpty(reasonStr) ? null : reasonStr;
     }
 
     private void ingestBlockedRequest(Map<String, Object> proxyData,
@@ -291,7 +297,7 @@ public class ArcadeWebhookAction extends ActionSupport {
             String executionId) {
         try {
             Map<String, Object> responseBody = new HashMap<>();
-            if (executionId != null && !executionId.isEmpty()) {
+            if (!isNullOrEmpty(executionId)) {
                 responseBody.put("execution_id", executionId);
             }
             responseBody.put("code", CODE_CHECK_FAILED);
@@ -300,31 +306,29 @@ public class ArcadeWebhookAction extends ActionSupport {
             Map<String, Object> blockedResponse = new HashMap<>();
             blockedResponse.put("statusCode", 403);
             blockedResponse.put("status", "BLOCKED");
-            blockedResponse.put("headers", new HashMap<>());
+            blockedResponse.put("headers", Collections.emptyMap());
             blockedResponse.put("body", objectMapper.writeValueAsString(responseBody));
 
-            Map<String, Object> queryParams = new HashMap<>();
+            Map<String, Object> queryParams = baseQueryParams();
             queryParams.put("ingest_data", "true");
-            queryParams.put("akto_connector", AKTO_CONNECTOR);
 
             Map<String, Object> ingestData = new HashMap<>(proxyData);
             ingestData.put("response", blockedResponse);
             ingestData.put("urlQueryParams", queryParams);
 
             gateway.processHttpProxy(ingestData);
-            loggerMaker.info("Blocked request ingested, execution_id: " + executionId);
         } catch (Exception e) {
-            loggerMaker.errorAndAddToDb("Error ingesting blocked request: " + e.getMessage(),
-                    LoggerMaker.LogDb.DATA_INGESTION);
+            logError("Error ingesting blocked request", e);
         }
     }
 
     private void populateFieldsFromRequest(Map<String, Object> bodyMap, HttpServletRequest request) {
-        this.tool           = extractMap(bodyMap.get("tool"));
-        this.inputs         = extractMap(bodyMap.get("inputs"));
-        this.context        = extractMap(bodyMap.get("context"));
-        this.execution_id   = extractString(bodyMap.get("execution_id"));
-        if (this.execution_id == null || this.execution_id.isEmpty()) {
+        if (bodyMap == null) bodyMap = new HashMap<>();
+        this.tool = extractMap(bodyMap.get("tool"));
+        this.inputs = extractMap(bodyMap.get("inputs"));
+        this.context = extractMap(bodyMap.get("context"));
+        this.execution_id = extractString(bodyMap.get("execution_id"));
+        if (isNullOrEmpty(this.execution_id)) {
             this.execution_id = request.getHeader(HEADER_EXECUTION_ID);
         }
         this.toolkits       = bodyMap.get("toolkits");
@@ -337,31 +341,29 @@ public class ArcadeWebhookAction extends ActionSupport {
 
     private String readRequestBody(HttpServletRequest request) {
         try (BufferedReader reader = new BufferedReader(
-                new InputStreamReader(request.getInputStream()))) {
+                new InputStreamReader(request.getInputStream(), StandardCharsets.UTF_8))) {
             return reader.lines().collect(Collectors.joining("\n"));
         } catch (Exception e) {
-            loggerMaker.errorAndAddToDb("Error reading request body: " + e.getMessage(),
-                    LoggerMaker.LogDb.DATA_INGESTION);
+            logError("Error reading request body", e);
             return "";
         }
     }
 
     @SuppressWarnings("unchecked")
     private Map<String, Object> parseJsonBody(String jsonBody) {
-        if (jsonBody == null || jsonBody.isEmpty()) return new HashMap<>();
+        if (isNullOrEmpty(jsonBody)) return new HashMap<>();
         try {
             return objectMapper.readValue(jsonBody, Map.class);
         } catch (Exception e) {
-            loggerMaker.errorAndAddToDb("Error parsing JSON body: " + e.getMessage(),
-                    LoggerMaker.LogDb.DATA_INGESTION);
+            logError("Error parsing JSON body", e);
             return new HashMap<>();
         }
     }
 
     private String extractToolName() {
-        if (tool == null) return "unknown";
+        if (tool == null) return UNKNOWN_TOOL;
         Object name = tool.get("name");
-        return name != null ? name.toString() : "unknown";
+        return name != null ? name.toString() : UNKNOWN_TOOL;
     }
 
     @SuppressWarnings("unchecked")

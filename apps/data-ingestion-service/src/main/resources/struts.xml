@@ -52,7 +52,7 @@
             </result>
         </action>
 
-
+        <!-- Arcade.dev Webhook Endpoints -->
         <action name="health" class="com.akto.action.ArcadeWebhookAction" method="health">
             <interceptor-ref name="defaultStack" />
             <result name="SUCCESS" type="json">
@@ -91,6 +91,7 @@
                 <param name="excludeNullProperties">true</param>
             </result>
         </action>
+        <!-- End of Arcade.dev Webhook Endpoints -->
 
         <action name="api/http-proxy/truefoundry" class="com.akto.action.HttpProxyAction" method="truefoundryProxy">
             <interceptor-ref name="json"/>
