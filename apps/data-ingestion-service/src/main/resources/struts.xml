@@ -53,26 +53,41 @@
         </action>
 
         <!-- Arcade Webhook Endpoints -->
-        <action name="pre" class="com.akto.action.ArcadeWebhookAction" method="arcade">
+        <action name="health" class="com.akto.action.ArcadeWebhookAction" method="health">
             <interceptor-ref name="defaultStack" />
             <result name="SUCCESS" type="json">
-                <param name="includeProperties">^code,^error_message</param>
-            </result>
-            <result name="ERROR" type="json">
-                <param name="includeProperties">^code,^error_message</param>
+                <param name="includeProperties">^status</param>
             </result>
         </action>
 
-        <action name="post" class="com.akto.action.ArcadeWebhookAction" method="arcade">
+        <!-- Pre-execution hook: returns code (OK/CHECK_FAILED/RATE_LIMIT_EXCEEDED), error_message, override -->
+        <!-- Per Arcade API: execution_id is NOT in response, only in request for correlation -->
+        <action name="pre" class="com.akto.action.ArcadeWebhookAction" method="preExecution">
             <interceptor-ref name="defaultStack" />
             <result name="SUCCESS" type="json">
-                <param name="includeProperties">^code,^error_message</param>
+                <param name="includeProperties">^code$,^error_message$,^override.*</param>
+                <param name="excludeNullProperties">true</param>
             </result>
             <result name="ERROR" type="json">
-                <param name="includeProperties">^code,^error_message</param>
+                <param name="includeProperties">^code$,^error_message$,^override.*</param>
+                <param name="excludeNullProperties">true</param>
             </result>
         </action>
-      
+
+        <!-- Post-execution hook: returns code (OK/CHECK_FAILED/RATE_LIMIT_EXCEEDED), error_message, override -->
+        <!-- Per Arcade API: execution_id is NOT in response, only in request for correlation -->
+        <action name="post" class="com.akto.action.ArcadeWebhookAction" method="postExecution">
+            <interceptor-ref name="defaultStack" />
+            <result name="SUCCESS" type="json">
+                <param name="includeProperties">^code$,^error_message$,^override.*</param>
+                <param name="excludeNullProperties">true</param>
+            </result>
+            <result name="ERROR" type="json">
+                <param name="includeProperties">^code$,^error_message$,^override.*</param>
+                <param name="excludeNullProperties">true</param>
+            </result>
+        </action>
+
         <action name="api/http-proxy/truefoundry" class="com.akto.action.HttpProxyAction" method="truefoundryProxy">
             <interceptor-ref name="json"/>
             <interceptor-ref name="defaultStack" />
